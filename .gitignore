@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.venv/
+venv/
+env/
+.conda/
+*.so
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Uploads
+backend/uploads/*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
