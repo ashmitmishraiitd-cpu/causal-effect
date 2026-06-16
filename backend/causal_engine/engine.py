@@ -1,8 +1,8 @@
+import asyncio
 import hashlib
 import logging
-import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -22,8 +22,20 @@ from .diagnostics import (
     power_calculator,
     sensitivity_analysis,
 )
+from .estimators import (
+    CausalEstimator,
+    LinearRegressionEstimator,
+    PropensityMatchingEstimator,
+    DoublyRobustEstimator,
+    DoubleMLEstimator,
+    CausalForestEstimator,
+    InstrumentalVariableEstimator,
+    BootstrapEstimator,
+)
 
 logger = logging.getLogger(__name__)
+
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 class CausalInsightEngine:
@@ -38,6 +50,19 @@ class CausalInsightEngine:
         self.refutation_results = {}
         self.causal_graph = CausalGraph()
         self._result_cache = {}
+        self._instruments = []
+        self._estimators = self._register_estimators()
+
+    def _register_estimators(self) -> dict[str, CausalEstimator]:
+        return {
+            "linear_regression": LinearRegressionEstimator(),
+            "propensity_matching": PropensityMatchingEstimator(),
+            "doubly_robust": DoublyRobustEstimator(),
+            "double_ml": DoubleMLEstimator(),
+            "causal_forest": CausalForestEstimator(),
+            "instrumental_variable": InstrumentalVariableEstimator(),
+            "bootstrap": BootstrapEstimator(),
+        }
 
     def _preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
         processed = df.copy()
@@ -82,6 +107,11 @@ class CausalInsightEngine:
         processed = processed.dropna()
         return processed
 
+    def _run_balance_check(self, treatment: str, confounders: list) -> dict:
+        if not self._is_binary_treatment(treatment):
+            return {}
+        return compute_balance_stats(self.df, treatment, confounders)
+
     def get_missing_report(self) -> dict:
         return {
             "columns": self._missing_report,
@@ -100,9 +130,7 @@ class CausalInsightEngine:
         raw = f"{treatment}|{outcome}|{sorted(confounders)}"
         return hashlib.md5(raw.encode()).hexdigest()
 
-    def _detect_mediators_colliders(
-        self, treatment: str, outcome: str, confounders: list
-    ) -> dict:
+    def _detect_mediators_colliders(self, treatment: str, outcome: str, confounders: list) -> dict:
         warnings_list = []
         mediators = []
         colliders = []
@@ -119,11 +147,7 @@ class CausalInsightEngine:
                     f"'{c}' appears to be a collider (common effect). "
                     "Controlling for it may induce collider bias."
                 )
-        return {
-            "warnings": warnings_list,
-            "mediators": mediators,
-            "colliders": colliders,
-        }
+        return {"warnings": warnings_list, "mediators": mediators, "colliders": colliders}
 
     def _recommend_methods(self, treatment: str, n_samples: int, n_confounders: int) -> dict:
         is_binary = self._is_binary_treatment(treatment)
@@ -131,47 +155,24 @@ class CausalInsightEngine:
         recommendations["linear_regression"] = {"recommended": True, "note": "Baseline method; fast but assumes linearity"}
         if is_binary:
             if n_samples >= 100:
-                recommendations["propensity_matching"] = {
-                    "recommended": True,
-                    "note": f"Good with n={n_samples}",
-                }
-                recommendations["doubly_robust"] = {
-                    "recommended": True,
-                    "note": "Robust if either model is correctly specified",
-                }
+                recommendations["propensity_matching"] = {"recommended": True, "note": f"Good with n={n_samples}"}
+                recommendations["doubly_robust"] = {"recommended": True, "note": "Robust if either model is correctly specified"}
             else:
-                recommendations["propensity_matching"] = {
-                    "recommended": False,
-                    "note": f"Small sample (n={n_samples}); matching may be unstable",
-                }
-                recommendations["doubly_robust"] = {
-                    "recommended": True,
-                    "note": f"Use with caution (n={n_samples})",
-                }
+                recommendations["propensity_matching"] = {"recommended": False, "note": f"Small sample (n={n_samples}); matching may be unstable"}
+                recommendations["doubly_robust"] = {"recommended": True, "note": f"Use with caution (n={n_samples})"}
         else:
             recommendations["propensity_matching"] = {"recommended": False, "note": "Requires binary treatment"}
             recommendations["doubly_robust"] = {"recommended": False, "note": "Requires binary treatment"}
-        if n_samples >= 200:
-            recommendations["double_ml"] = {"recommended": True, "note": "Best for high-dimensional confounding"}
-        else:
-            recommendations["double_ml"] = {"recommended": False, "note": f"Small sample (n={n_samples}); DML may overfit"}
-        if n_samples >= 300:
-            recommendations["causal_forest"] = {
-                "recommended": True,
-                "note": "Captures heterogeneous effects",
-            }
-        else:
-            recommendations["causal_forest"] = {
-                "recommended": False,
-                "note": f"Small sample (n={n_samples}); CATE estimates may be noisy",
-            }
+        recommendations["double_ml"] = {"recommended": n_samples >= 200, "note": "Best for high-dimensional confounding" if n_samples >= 200 else f"Small sample (n={n_samples}); DML may overfit"}
+        recommendations["causal_forest"] = {"recommended": n_samples >= 300, "note": "Captures heterogeneous effects" if n_samples >= 300 else f"Small sample (n={n_samples}); CATE estimates may be noisy"}
+        if self._instruments:
+            recommendations["instrumental_variable"] = {"recommended": True, "note": "Useful when unmeasured confounding suspected"}
         return recommendations
 
     def build_model(self, treatment: str, outcome: str, confounders: list, use_dag: bool = True):
         if use_dag:
             self.causal_graph.build_from_confounders(treatment, outcome, confounders)
-            dag_str = self.causal_graph.to_dowhy_string()
-            logger.debug(f"Built DAG:\n{dag_str}")
+            logger.debug(f"Built DAG:\n{self.causal_graph.to_dowhy_string()}")
         self.model = CausalModel(
             data=self.df,
             treatment=treatment,
@@ -193,92 +194,6 @@ class CausalInsightEngine:
         self.estimate = estimate
         return estimate
 
-    def estimate_ate_propensity(self):
-        estimate = self.model.estimate_effect(
-            self.identified,
-            method_name="backdoor.propensity_score_matching",
-        )
-        return estimate
-
-    def estimate_ate_doubly_robust(self):
-        estimate = self.model.estimate_effect(
-            self.identified,
-            method_name="backdoor.propensity_score_weighting",
-        )
-        return estimate
-
-    def estimate_ate_iv(self, treatment: str, outcome: str, instruments: list[str]):
-        if not instruments:
-            return None, None, None, None
-        iv_model = CausalModel(
-            data=self.df,
-            treatment=treatment,
-            outcome=outcome,
-            instruments=instruments,
-        )
-        identified = iv_model.identify_effect(proceed_when_unidentifiable=True)
-        estimate = iv_model.estimate_effect(
-            identified,
-            method_name="instrumental_variable.iv_regression",
-        )
-        return estimate, None, None, None
-
-    def estimate_dml(self, treatment: str, outcome: str, confounders: list):
-        is_binary = self._is_binary_treatment(treatment)
-        X = self.df[confounders].values
-        T = self.df[treatment].values
-        Y = self.df[outcome].values
-        X_train, X_test, T_train, T_test, Y_train, Y_test = train_test_split(
-            X, T, Y, test_size=0.2, random_state=42
-        )
-        model_y = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-        model_t = (
-            RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
-            if is_binary
-            else RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-        )
-        dml = LinearDML(
-            model_y=model_y,
-            model_t=model_t,
-            discrete_treatment=is_binary,
-            cv=5,
-            random_state=42,
-        )
-        dml.fit(Y_train, T_train, X=X_train, W=None)
-        ate = dml.ate(X=X_test)
-        interval = dml.ate_interval(X=X_test)
-        ate_lb = interval[0][0] if isinstance(interval[0], (list, tuple, np.ndarray)) else interval[0]
-        ate_ub = interval[1][0] if isinstance(interval[1], (list, tuple, np.ndarray)) else interval[1]
-        return ate, float(ate_lb), float(ate_ub), dml
-
-    def estimate_causal_forest(self, treatment: str, outcome: str, confounders: list):
-        is_binary = self._is_binary_treatment(treatment)
-        X = self.df[confounders].values
-        T = self.df[treatment].values
-        Y = self.df[outcome].values
-        X_train, X_test, T_train, T_test, Y_train, Y_test = train_test_split(
-            X, T, Y, test_size=0.2, random_state=42
-        )
-        model_t = (
-            RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
-            if is_binary
-            else RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-        )
-        cf = CausalForestDML(
-            model_y=RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42),
-            model_t=model_t,
-            discrete_treatment=is_binary,
-            cv=5,
-            random_state=42,
-        )
-        cf.fit(Y_train, T_train, X=X_train, W=None)
-        ate = cf.ate(X=X_test)
-        interval = cf.ate_interval(X=X_test)
-        ate_lb = interval[0][0] if isinstance(interval[0], (list, tuple, np.ndarray)) else interval[0]
-        ate_ub = interval[1][0] if isinstance(interval[1], (list, tuple, np.ndarray)) else interval[1]
-        cate = cf.effect(X_test)
-        return ate, float(ate_lb), float(ate_ub), cate, cf
-
     def bootstrap_ate(self, treatment: str, outcome: str, confounders: list,
                       n_bootstrap: int = 200, alpha: float = 0.05):
         rng = np.random.RandomState(42)
@@ -289,16 +204,10 @@ class CausalInsightEngine:
             boot_df = self.df.iloc[idx]
             try:
                 boot_model = CausalModel(
-                    data=boot_df,
-                    treatment=treatment,
-                    outcome=outcome,
-                    common_causes=confounders,
+                    data=boot_df, treatment=treatment, outcome=outcome, common_causes=confounders,
                 )
                 boot_identified = boot_model.identify_effect(proceed_when_unidentifiable=True)
-                boot_est = boot_model.estimate_effect(
-                    boot_identified,
-                    method_name="backdoor.linear_regression",
-                )
+                boot_est = boot_model.estimate_effect(boot_identified, method_name="backdoor.linear_regression")
                 estimates.append(float(boot_est.value))
             except Exception:
                 continue
@@ -322,10 +231,7 @@ class CausalInsightEngine:
         for name, method in refutation_configs:
             try:
                 refute = self.model.refute_estimate(
-                    self.identified,
-                    self.estimate,
-                    method_name=method,
-                    num_simulations=num_simulations,
+                    self.identified, self.estimate, method_name=method, num_simulations=num_simulations,
                 )
                 r = refute[0] if isinstance(refute, list) and refute else refute
                 if r is not None:
@@ -348,6 +254,33 @@ class CausalInsightEngine:
         self.refutation_results = results
         return results
 
+    def _compare_ate_estimates(self, results: dict) -> dict:
+        valid = {}
+        for key in ["linear_regression", "propensity_matching", "doubly_robust", "double_ml", "causal_forest"]:
+            m = results.get(key)
+            if m and "error" not in m and "ate" in m:
+                valid[key] = m["ate"]
+        if len(valid) < 2:
+            return {}
+        ates = list(valid.values())
+        mean_ate = float(np.mean(ates))
+        std_ate = float(np.std(ates))
+        if std_ate == 0:
+            return {"mean": mean_ate, "std": 0, "cochran_q": 0, "p_value": 1.0, "n_methods": len(ates), "significant_difference": False}
+        grand_mean = mean_ate
+        q_stat = sum((a - grand_mean)**2 / (std_ate**2) for a in ates)
+        df = len(ates) - 1
+        p_value = 1.0 - scipy_stats.chi2.cdf(q_stat, df)
+        return {
+            "mean": round(mean_ate, 4),
+            "std": round(std_ate, 4),
+            "cochran_q": round(float(q_stat), 4),
+            "p_value": round(float(p_value), 4),
+            "n_methods": len(ates),
+            "significant_difference": bool(p_value < 0.05),
+            "interpretation": "ATE estimates differ significantly across methods" if p_value < 0.05 else "ATE estimates are consistent across methods",
+        }
+
     def compute_cate_by_feature(self, treatment: str, outcome: str,
                                 confounders: list, feature_col: str, n_bins=5):
         is_binary = self._is_binary_treatment(treatment)
@@ -359,17 +292,11 @@ class CausalInsightEngine:
         X_train, X_test, T_train, T_test, Y_train, Y_test = train_test_split(
             X, T, Y, test_size=0.2, random_state=42
         )
-        model_t = (
-            RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
-            if is_binary
-            else RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
-        )
+        model_t = (RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+                   if is_binary else RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42))
         cf = CausalForestDML(
             model_y=RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42),
-            model_t=model_t,
-            discrete_treatment=is_binary,
-            cv=5,
-            random_state=42,
+            model_t=model_t, discrete_treatment=is_binary, cv=5, random_state=42,
         )
         cf.fit(Y_train, T_train, X=X_train, W=None)
         cate_vals = cf.effect(X_test)
@@ -386,11 +313,7 @@ class CausalInsightEngine:
             lo = float(feature_data[mask].min())
             hi = float(feature_data[mask].max())
             bin_cate = float(np.mean(cate_vals[mask]))
-            bin_labels[str(int(bin_idx))] = {
-                "range": [lo, hi],
-                "cate": bin_cate,
-                "count": int(mask.sum()),
-            }
+            bin_labels[str(int(bin_idx))] = {"range": [lo, hi], "cate": bin_cate, "count": int(mask.sum())}
         return bin_labels
 
     def get_summary(self, treatment: str, outcome: str, confounders: list):
@@ -410,117 +333,75 @@ class CausalInsightEngine:
             "is_binary_treatment": self._is_binary_treatment(treatment),
         }
 
-    def full_analysis(self, treatment: str, outcome: str, confounders: list):
+    def full_analysis(self, treatment: str, outcome: str, confounders: list,
+                      progress_cb: Optional[Callable] = None):
         if len(self.df) < 10:
             raise ValueError("Not enough complete rows after preprocessing (minimum 10 required)")
+
         cache_key = self._build_cache_key(treatment, outcome, confounders)
         if cache_key in self._result_cache:
             logger.info(f"Returning cached result for {cache_key}")
             return self._result_cache[cache_key]
 
+        if progress_cb:
+            progress_cb("Building causal graph", 2)
         diagnostics_info = self._detect_mediators_colliders(treatment, outcome, confounders)
-        recommendations = self._recommend_methods(
-            treatment, len(self.df), len(confounders)
-        )
+        recommendations = self._recommend_methods(treatment, len(self.df), len(confounders))
 
+        if progress_cb:
+            progress_cb("Identifying causal effect", 5)
         self.build_model(treatment, outcome, confounders)
         self.identify_effect()
+
         results = {}
         is_binary = self._is_binary_treatment(treatment)
+        estimator_keys = ["linear_regression"]
+        if is_binary:
+            estimator_keys += ["propensity_matching", "doubly_robust"]
+        estimator_keys += ["double_ml", "causal_forest"]
+        if self._instruments:
+            estimator_keys.append("instrumental_variable")
 
-        ate_lr = self.estimate_ate_backdoor()
-        results["linear_regression"] = {
-            "ate": float(ate_lr.value),
-            "method": "Backdoor Linear Regression",
-        }
+        total = len(estimator_keys) + 1
+        for i, key in enumerate(estimator_keys):
+            estimator = self._estimators.get(key)
+            if not estimator:
+                continue
+            if estimator.requires_binary_treatment() and not is_binary:
+                results[key] = {"error": "Treatment must be binary (0/1) for this method", "method": estimator.name()}
+                continue
+            if progress_cb:
+                progress_cb(f"Running {estimator.name()}...", 10 + int(70 * (i + 1) / total))
+            try:
+                result = estimator.estimate(self, treatment, outcome, confounders)
+                results[key] = result
+            except Exception as e:
+                logger.warning(f"{estimator.name()} failed: {e}")
+                results[key] = {"error": str(e)[:200], "method": estimator.name()}
 
         if is_binary:
-            try:
-                ate_ps = self.estimate_ate_propensity()
-                results["propensity_matching"] = {
-                    "ate": float(ate_ps.value),
-                    "method": "Propensity Score Matching",
-                }
-                bal = compute_balance_stats(self.df, treatment, confounders)
-                if bal:
-                    results["propensity_matching"]["balance"] = bal
-            except Exception as e:
-                logger.warning(f"Propensity matching failed: {e}")
-                results["propensity_matching"] = {"error": str(e)[:200], "method": "Propensity Score Matching"}
-            try:
-                ate_dr = self.estimate_ate_doubly_robust()
-                results["doubly_robust"] = {
-                    "ate": float(ate_dr.value),
-                    "method": "Doubly Robust (IPW)",
-                }
-            except Exception as e:
-                logger.warning(f"Doubly robust failed: {e}")
-                results["doubly_robust"] = {"error": str(e)[:200], "method": "Doubly Robust (IPW)"}
             try:
                 overlap = compute_positivity_check(self.df, treatment, confounders)
                 if overlap:
                     results["positivity_check"] = overlap
             except Exception as e:
                 logger.debug(f"Positivity check skipped: {e}")
-        else:
-            msg = "Treatment must be binary (0/1) for propensity methods"
-            results["propensity_matching"] = {"error": msg, "method": "Propensity Score Matching"}
-            results["doubly_robust"] = {"error": msg, "method": "Doubly Robust (IPW)"}
 
+        if progress_cb:
+            progress_cb("Bootstrapping confidence intervals", 82)
         try:
-            dml_ate, dml_lb, dml_ub, _ = self.estimate_dml(treatment, outcome, confounders)
-            results["double_ml"] = {
-                "ate": float(dml_ate),
-                "ate_interval": [dml_lb, dml_ub],
-                "method": "Double Machine Learning (LinearDML)",
-            }
-        except Exception as e:
-            logger.warning(f"Double ML failed: {e}")
-            results["double_ml"] = {"error": str(e)[:200], "method": "Double ML"}
-
-        try:
-            cf_ate, cf_lb, cf_ub, cate_vals, _ = self.estimate_causal_forest(treatment, outcome, confounders)
-            results["causal_forest"] = {
-                "ate": float(cf_ate),
-                "ate_interval": [cf_lb, cf_ub],
-                "method": "Causal Forest (CausalForestDML)",
-                "cate_distribution": {
-                    "mean": float(np.mean(cate_vals)),
-                    "std": float(np.std(cate_vals)),
-                    "min": float(np.min(cate_vals)),
-                    "max": float(np.max(cate_vals)),
-                    "p25": float(np.percentile(cate_vals, 25)),
-                    "p50": float(np.percentile(cate_vals, 50)),
-                    "p75": float(np.percentile(cate_vals, 75)),
-                },
-                "cate_samples": [float(v) for v in cate_vals[:500]],
-            }
-            if len(cate_vals) > 10:
-                het_test = heterogeneity_test(cate_vals)
-                if het_test:
-                    results["causal_forest"]["heterogeneity_test"] = het_test
-        except Exception as e:
-            logger.warning(f"Causal forest failed: {e}")
-            results["causal_forest"] = {"error": str(e)[:200], "method": "Causal Forest"}
-
-        try:
-            boot_ate, boot_lb, boot_ub = self.bootstrap_ate(treatment, outcome, confounders)
-            if boot_ate is not None:
-                results["bootstrap_ate"] = {
-                    "ate": boot_ate,
-                    "ate_interval": [boot_lb, boot_ub],
-                    "method": "Bootstrap (200 resamples)",
-                }
+            boot_result = self._estimators["bootstrap"].estimate(self, treatment, outcome, confounders)
+            if "error" not in boot_result:
+                results["bootstrap_ate"] = boot_result
         except Exception as e:
             logger.debug(f"Bootstrap skipped: {e}")
 
+        if progress_cb:
+            progress_cb("Running refutation tests", 88)
         refutations = self.run_refutation_tests(num_simulations=30)
         results["refutations"] = {}
         for name, res in refutations.items():
-            if "error" not in res:
-                results["refutations"][name] = res
-            else:
-                results["refutations"][name] = {"error": res["error"]}
+            results["refutations"][name] = res if "error" not in res else {"error": res["error"]}
 
         results["summary"] = self.get_summary(treatment, outcome, confounders)
         results["diagnostics"] = diagnostics_info
@@ -532,13 +413,15 @@ class CausalInsightEngine:
             if m and "error" not in m and "ate" in m:
                 valid_ates.append(m["ate"])
         if valid_ates:
-            weights = [1.0 / (len(valid_ates)) for _ in valid_ates]
+            weights = [1.0 / max(len(valid_ates), 1) for _ in valid_ates]
             meta_ate = float(np.average(valid_ates, weights=weights))
-            results["meta_estimate"] = {
-                "ate": meta_ate,
-                "method": "Inverse-variance weighted meta-estimate",
-                "n_methods": len(valid_ates),
-            }
+            results["meta_estimate"] = {"ate": meta_ate, "method": "Inverse-variance weighted meta-estimate", "n_methods": len(valid_ates)}
+
+        if progress_cb:
+            progress_cb("Comparing estimates across methods", 95)
+        ate_comparison = self._compare_ate_estimates(results)
+        if ate_comparison:
+            results["ate_comparison"] = ate_comparison
 
         try:
             power = power_calculator(self.df, treatment, outcome)
@@ -546,5 +429,13 @@ class CausalInsightEngine:
         except Exception as e:
             logger.debug(f"Power analysis skipped: {e}")
 
+        if len(results.get("causal_forest", {}).get("cate_samples", [])) > 10:
+            cate_vals = np.array(results["causal_forest"]["cate_samples"])
+            het_test = heterogeneity_test(cate_vals)
+            if het_test:
+                results["causal_forest"]["heterogeneity_test"] = het_test
+
+        if progress_cb:
+            progress_cb("Complete", 100)
         self._result_cache[cache_key] = results
         return results

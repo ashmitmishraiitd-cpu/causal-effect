@@ -18,6 +18,12 @@ dist/
 # Uploads
 backend/uploads/*.csv
 
+# SQLite DB
+*.db
+
+# Test artifacts
+.cache/
+
 # IDE
 .vscode/
 .idea/

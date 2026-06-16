@@ -1,22 +1,27 @@
 import os
-import uuid
+import json
 import logging
 import shutil
 from contextlib import asynccontextmanager
+from typing import Optional
 
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.routing import APIRouter
 
-from causal_engine import CausalInsightEngine
-from causal_engine.models import (
-    AnalysisResponse,
-    CateResponse,
-    HealthResponse,
-    SessionResponse,
-    UploadResponse,
+from causal_engine import (
+    CausalInsightEngine,
+    init_db,
+    session_count,
+    cleanup_expired,
+    handle_upload,
+    get_session_data,
+    run_analysis,
+    run_cate,
+    register_progress_callback,
 )
+from causal_engine.models import HealthResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,9 +29,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("causal_effect.api")
 
+MAX_FILE_SIZE = 50 * 1024 * 1024
+SAMPLE_DATA = os.path.join(os.path.dirname(__file__), "sample_causal_data.csv")
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+API_TOKEN = os.environ.get("CAUSAL_EFFECT_API_TOKEN")
+_ws_clients: dict[str, list[WebSocket]] = {}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Causal Effect API")
+    init_db()
     yield
     if os.path.exists(UPLOAD_DIR):
         shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
@@ -45,131 +60,20 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-SAMPLE_DATA = os.path.join(os.path.dirname(__file__), "sample_causal_data.csv")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# === API v1 Router ===
+v1 = APIRouter(prefix="/v1", tags=["v1"])
 
-MAX_FILE_SIZE = 50 * 1024 * 1024
-
-sessions: dict[str, dict] = {}
+# === API v2 Router ===
+v2 = APIRouter(prefix="/v2", tags=["v2"])
 
 
-def _get_session(session_id: str) -> dict:
-    session = sessions.get(session_id)
-    if session is None:
-        raise HTTPException(404, "Session not found or expired. Re-upload the CSV.")
-    return session
-
-
-def _parse_csv_metadata(filepath: str, filename: str):
-    df = pd.read_csv(filepath)
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    categorical_cols = df.select_dtypes(exclude=["number"]).columns.tolist()
-    all_columns = df.columns.tolist()
-    sample_data = df.head(10).to_dict(orient="records")
-
-    col_info = {}
-    for col in all_columns:
-        is_binary = col in numeric_cols and set(df[col].dropna().unique()) <= {0, 1}
-        col_info[col] = {
-            "dtype": str(df[col].dtype),
-            "unique": int(df[col].nunique()),
-            "missing": int(df[col].isna().sum()),
-            "is_numeric": col in numeric_cols,
-            "is_binary": is_binary,
-        }
-        if col in numeric_cols:
-            desc = df[col].describe().to_dict()
-            col_info[col]["stats"] = {
-                k: float(v) if isinstance(v, (int, float)) else v for k, v in desc.items()
-            }
-
-    return df, {
-        "filename": filename,
-        "rows": len(df),
-        "columns": len(all_columns),
-        "numeric_columns": numeric_cols,
-        "categorical_columns": categorical_cols,
-        "all_columns": all_columns,
-        "column_info": col_info,
-        "sample": sample_data,
-    }
-
-
-async def _handle_upload(file: UploadFile):
-    if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(400, "Only CSV files accepted")
-
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB")
-
-    session_id = str(uuid.uuid4())[:8]
-    filepath = os.path.join(UPLOAD_DIR, f"{session_id}.csv")
-
-    try:
-        with open(filepath, "wb") as f:
-            f.write(content)
-    except OSError as e:
-        logger.error(f"Failed to write upload: {e}")
-        raise HTTPException(500, "Failed to save uploaded file")
-
-    try:
-        df, metadata = _parse_csv_metadata(filepath, file.filename)
-    except Exception as e:
-        os.remove(filepath)
-        logger.warning(f"CSV parse failed: {e}")
-        raise HTTPException(400, f"Failed to parse CSV: {str(e)}")
-
-    sessions[session_id] = {"filepath": filepath, "df": df, "columns": metadata["all_columns"]}
-    logger.info(f"Session {session_id}: {metadata['rows']} rows, {metadata['columns']} cols")
-
-    return JSONResponse({"session_id": session_id, **metadata})
-
-
-def _run_analysis(session_id: str, treatment: str, outcome: str, confounders: str):
-    session = _get_session(session_id)
-    confounders_list = [c.strip() for c in confounders.split(",") if c.strip()]
-    df = session["df"]
-
-    for col in [treatment, outcome] + confounders_list:
-        if col not in df.columns:
-            raise HTTPException(400, f"Column '{col}' not found in dataset")
-
-    logger.info(f"Analysis start: treatment={treatment}, outcome={outcome}, confounders={confounders_list}")
-    try:
-        engine = CausalInsightEngine(df)
-        results = engine.full_analysis(treatment, outcome, confounders_list)
-        sessions[session_id]["config"] = {
-            "treatment": treatment,
-            "outcome": outcome,
-            "confounders": confounders_list,
-        }
-        logger.info(f"Analysis complete for session {session_id}")
-        return JSONResponse({"status": "success", "results": results})
-    except ValueError as e:
-        logger.error(f"Analysis validation error: {e}")
-        raise HTTPException(422, str(e))
-    except Exception as e:
-        logger.exception(f"Analysis failed for session {session_id}")
-        raise HTTPException(500, f"Analysis failed: {str(e)}")
-
-
-# === Auth middleware (Tip 23) ===
-API_TOKEN = os.environ.get("CAUSAL_EFFECT_API_TOKEN")
-
-
-async def verify_token(authorization: str = None):
+async def verify_token(authorization: Optional[str] = None):
     if API_TOKEN is None:
         return True
     if not authorization:
@@ -180,7 +84,48 @@ async def verify_token(authorization: str = None):
     return True
 
 
-# === Endpoints ===
+# === WebSocket progress ===
+@app.websocket("/ws/{session_id}")
+async def websocket_progress(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    if session_id not in _ws_clients:
+        _ws_clients[session_id] = []
+    _ws_clients[session_id].append(websocket)
+
+    def progress_cb(data: dict):
+        asyncio_run(websocket.send_json(data))
+
+    register_progress_callback(session_id, progress_cb)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        _ws_clients[session_id].remove(websocket)
+
+
+def asyncio_run(coro):
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(coro)
+        else:
+            loop.run_until_complete(coro)
+    except RuntimeError:
+        asyncio.run(coro)
+
+
+def _progress_websocket_cb(session_id: str, message: str, pct: float):
+    if session_id in _ws_clients:
+        payload = json.dumps({"message": message, "pct": pct})
+        for ws in _ws_clients[session_id][:]:
+            try:
+                asyncio_run(ws.send_json({"message": message, "pct": pct}))
+            except Exception:
+                _ws_clients[session_id].remove(ws)
+
+
+# === Meta endpoints (unversioned) ===
 
 @app.get("/", tags=["Meta"])
 def root():
@@ -190,8 +135,8 @@ def root():
         "version": "2.0.0",
         "endpoints": {
             "upload": "/upload-csv",
-            "analyze": "/analyze",
-            "cate": "/cate",
+            "analyze": "/v2/analyze",
+            "cate": "/v2/cate",
             "health": "/health",
             "docs": "/docs",
         },
@@ -200,51 +145,136 @@ def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["Meta"])
 def health():
-    return HealthResponse(status="healthy", active_sessions=len(sessions))
+    return HealthResponse(status="healthy", active_sessions=session_count())
 
 
 @app.get("/sample-data", tags=["Data"])
 def download_sample():
     if not os.path.exists(SAMPLE_DATA):
         raise HTTPException(404, "Sample dataset not found")
-    return FileResponse(
-        SAMPLE_DATA,
-        media_type="text/csv",
-        filename="sample_causal_data.csv",
-    )
+    return FileResponse(SAMPLE_DATA, media_type="text/csv", filename="sample_causal_data.csv")
 
 
-@app.post("/upload-csv", tags=["Data"])
+# === v1 endpoints (legacy compat) ===
+
+@v1.post("/upload-csv")
+async def v1_upload_csv(file: UploadFile = File(...)):
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB")
+    return JSONResponse(handle_upload(content, file.filename or "upload.csv"))
+
+
+@v1.post("/analyze")
+async def v1_analyze(
+    session_id: str = Form(...),
+    treatment: str = Form(...),
+    outcome: str = Form(...),
+    confounders: str = Form(...),
+    instruments: str = Form(""),
+):
+    result = run_analysis(session_id, treatment, outcome, confounders, instruments,
+                          progress_cb=lambda m, p: _progress_websocket_cb(session_id, m, p))
+    return JSONResponse(result)
+
+
+@v1.post("/cate")
+async def v1_cate(
+    session_id: str = Form(...),
+    treatment: str = Form(...),
+    outcome: str = Form(...),
+    confounders: str = Form(...),
+    feature: str = Form(...),
+):
+    return JSONResponse(run_cate(session_id, treatment, outcome, confounders, feature))
+
+
+# === v2 endpoints (current) ===
+
+@v2.post("/upload-csv")
+async def v2_upload_csv(file: UploadFile = File(...)):
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB")
+    return JSONResponse(handle_upload(content, file.filename or "upload.csv"))
+
+
+@v2.post("/analyze")
+async def v2_analyze(
+    session_id: str = Form(...),
+    treatment: str = Form(...),
+    outcome: str = Form(...),
+    confounders: str = Form(...),
+    instruments: str = Form(""),
+):
+    result = run_analysis(session_id, treatment, outcome, confounders, instruments,
+                          progress_cb=lambda m, p: _progress_websocket_cb(session_id, m, p))
+    return JSONResponse(result)
+
+
+@v2.post("/cate")
+async def v2_cate(
+    session_id: str = Form(...),
+    treatment: str = Form(...),
+    outcome: str = Form(...),
+    confounders: str = Form(...),
+    feature: str = Form(...),
+):
+    return JSONResponse(run_cate(session_id, treatment, outcome, confounders, feature))
+
+
+@v2.get("/sessions/{session_id}")
+def v2_get_session(session_id: str):
+    data = get_session_data(session_id)
+    df = data["df"]
+    return {
+        "session_id": session_id,
+        "rows": len(df),
+        "columns": data["session"]["columns"],
+        "config": data["session"].get("config"),
+        "preview": df.head(10).to_dict(orient="records"),
+    }
+
+
+app.include_router(v1)
+app.include_router(v2)
+
+
+# === Legacy unversioned endpoints (redirect to v2) ===
+
+@app.post("/upload-csv")
 async def upload_csv(file: UploadFile = File(...)):
-    return await _handle_upload(file)
+    return await v2_upload_csv(file)
 
 
-@app.post("/upload-metadata", tags=["Data"])
+@app.post("/upload-metadata")
 async def upload_metadata(file: UploadFile = File(...)):
-    return await _handle_upload(file)
+    return await v2_upload_csv(file)
 
 
-@app.post("/analyze", tags=["Analysis"])
+@app.post("/analyze")
 async def analyze(
     session_id: str = Form(...),
     treatment: str = Form(...),
     outcome: str = Form(...),
     confounders: str = Form(...),
+    instruments: str = Form(""),
 ):
-    return _run_analysis(session_id, treatment, outcome, confounders)
+    return await v2_analyze(session_id, treatment, outcome, confounders, instruments)
 
 
-@app.post("/compute-causal-impact", tags=["Analysis"])
+@app.post("/compute-causal-impact")
 async def compute_causal_impact(
     session_id: str = Form(...),
     treatment: str = Form(...),
     outcome: str = Form(...),
     confounders: str = Form(...),
+    instruments: str = Form(""),
 ):
-    return _run_analysis(session_id, treatment, outcome, confounders)
+    return await v2_analyze(session_id, treatment, outcome, confounders, instruments)
 
 
-@app.post("/cate", tags=["Analysis"])
+@app.post("/cate")
 async def cate_analysis(
     session_id: str = Form(...),
     treatment: str = Form(...),
@@ -252,43 +282,12 @@ async def cate_analysis(
     confounders: str = Form(...),
     feature: str = Form(...),
 ):
-    session = _get_session(session_id)
-    confounders_list = [c.strip() for c in confounders.split(",") if c.strip()]
-    df = session["df"]
-
-    for col in [treatment, outcome, feature] + confounders_list:
-        if col not in df.columns:
-            raise HTTPException(400, f"Column '{col}' not found")
-
-    try:
-        engine = CausalInsightEngine(df)
-        cate_result = engine.compute_cate_by_feature(
-            treatment, outcome, confounders_list, feature
-        )
-        return JSONResponse({
-            "status": "success",
-            "feature": feature,
-            "cate": cate_result,
-        })
-    except Exception as e:
-        logger.exception("CATE analysis failed")
-        raise HTTPException(500, f"CATE analysis failed: {str(e)}")
+    return await v2_cate(session_id, treatment, outcome, confounders, feature)
 
 
-@app.get("/sessions/{session_id}", tags=["Session"])
+@app.get("/sessions/{session_id}")
 def get_session(session_id: str):
-    session = _get_session(session_id)
-    df = session["df"]
-    return {
-        "session_id": session_id,
-        "rows": len(df),
-        "columns": session["columns"],
-        "config": session.get("config"),
-        "preview": df.head(10).to_dict(orient="records"),
-    }
-
-
-# Cleanup handled via lifespan context manager
+    return v2_get_session(session_id)
 
 
 if __name__ == "__main__":

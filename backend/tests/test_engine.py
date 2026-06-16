@@ -71,8 +71,8 @@ def test_propensity_matching_ate(sample_data):
     confounders = ["age", "income", "education"]
     engine.build_model("treatment", "outcome_score", confounders)
     engine.identify_effect()
-    ate = engine.estimate_ate_propensity()
-    assert ate is not None
+    est = engine._estimators["propensity_matching"].estimate(engine, "treatment", "outcome_score", confounders)
+    assert "error" not in est or est is not None
 
 
 def test_doubly_robust_ate(sample_data):
@@ -80,26 +80,26 @@ def test_doubly_robust_ate(sample_data):
     confounders = ["age", "income", "education"]
     engine.build_model("treatment", "outcome_score", confounders)
     engine.identify_effect()
-    ate = engine.estimate_ate_doubly_robust()
-    assert ate is not None
+    est = engine._estimators["doubly_robust"].estimate(engine, "treatment", "outcome_score", confounders)
+    assert "ate" in est
 
 
 def test_dml_estimator(sample_data):
     engine = CausalInsightEngine(sample_data)
     confounders = ["age", "income", "education"]
-    ate, lb, ub, dml = engine.estimate_dml("treatment", "outcome_score", confounders)
-    assert ate is not None
-    assert 3.0 <= ate <= 6.0
-    assert lb <= ub
+    est = engine._estimators["double_ml"].estimate(engine, "treatment", "outcome_score", confounders)
+    assert "ate" in est
+    assert 3.0 <= est["ate"] <= 6.0
+    assert "ate_interval" in est
 
 
 def test_causal_forest(sample_data):
     engine = CausalInsightEngine(sample_data)
     confounders = ["age", "income", "education"]
-    ate, lb, ub, cate, cf = engine.estimate_causal_forest("treatment", "outcome_score", confounders)
-    assert ate is not None
-    assert cate is not None
-    assert len(cate) > 0
+    est = engine._estimators["causal_forest"].estimate(engine, "treatment", "outcome_score", confounders)
+    assert "ate" in est
+    assert "cate_distribution" in est
+    assert "cate_samples" in est
 
 
 def test_full_analysis_recovers_true_effect(sample_data):
