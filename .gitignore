@@ -16,7 +16,7 @@ dist/
 *.tsbuildinfo
 
 # Uploads
-backend/uploads/*.csv
+backend/uploads/
 
 # SQLite DB
 *.db
@@ -27,6 +27,7 @@ backend/uploads/*.csv
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *.swn

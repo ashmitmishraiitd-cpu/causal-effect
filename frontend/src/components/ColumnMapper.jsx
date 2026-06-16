@@ -33,7 +33,7 @@ export default function ColumnMapper({ session, onAnalyze, setLoading, loading }
         outcome,
         confounders.join(',')
       );
-      onAnalyze(result.results);
+      onAnalyze(result.results || result);
     } catch (e) {
       setError(e.message);
     } finally {

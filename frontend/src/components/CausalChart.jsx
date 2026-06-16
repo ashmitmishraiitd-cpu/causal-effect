@@ -1,6 +1,7 @@
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Cell } from 'recharts';
 
-const round = (n, d = 4) => Number(n).toFixed(d);
+const num = v => v == null ? 0 : Number(v);
+const round = (n, d = 4) => num(n).toFixed(d);
 
 export default function CausalChart({ methods, type, cateDist, cateSamples }) {
   if (type === 'ate' && methods) {
@@ -87,8 +88,8 @@ export default function CausalChart({ methods, type, cateDist, cateSamples }) {
             <Bar dataKey="count" fill="#f87171" fillOpacity={0.6} radius={[4, 4, 0, 0]} animationDuration={800} animationBegin={400} />
           </BarChart>
         </ResponsiveContainer>
-        <p className="text-xs text-gray-500 text-center font-medium">
-          Distribution of individual treatment effects (CATE) across {cateSamples.length.toLocaleString()} units
+              <p className="text-xs text-gray-500 text-center font-medium">
+                Distribution of individual treatment effects (CATE) across {(cateSamples || []).length.toLocaleString()} units
         </p>
       </div>
     );

@@ -4,6 +4,7 @@ import FileUpload from './components/FileUpload.jsx';
 import ColumnMapper from './components/ColumnMapper.jsx';
 import ResultsDashboard from './components/ResultsDashboard.jsx';
 import LavaGlass from './components/LavaGlass.jsx';
+import ErrorBoundary from './components/ErrorBoundary.jsx';
 
 export default function App() {
   const [step, setStep] = useState('upload');
@@ -82,15 +83,17 @@ export default function App() {
           })}
         </div>
 
-        <div className="animate-fade-in-up" key={step}>
-          {step === 'upload' && <FileUpload onComplete={handleUploadComplete} />}
-          {step === 'configure' && session && (
-            <ColumnMapper session={session} onAnalyze={handleAnalysisComplete} setLoading={setLoading} loading={loading} />
-          )}
-          {step === 'results' && analysis && (
-            <ResultsDashboard analysis={analysis} session={session} onBack={() => setStep('configure')} />
-          )}
-        </div>
+        <ErrorBoundary key={step}>
+          <div className="animate-fade-in-up">
+            {step === 'upload' && <FileUpload onComplete={handleUploadComplete} />}
+            {step === 'configure' && session && (
+              <ColumnMapper session={session} onAnalyze={handleAnalysisComplete} setLoading={setLoading} loading={loading} />
+            )}
+            {step === 'results' && analysis && (
+              <ResultsDashboard analysis={analysis} session={session} onBack={() => setStep('configure')} />
+            )}
+          </div>
+        </ErrorBoundary>
       </main>
 
       <footer className="text-center py-6 text-[11px] text-gray-500 font-medium tracking-wide relative z-10">
