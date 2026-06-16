@@ -1,15 +1,46 @@
 import os
 import uuid
+import logging
+import shutil
+from contextlib import asynccontextmanager
+
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+
 from causal_engine import CausalInsightEngine
+from causal_engine.models import (
+    AnalysisResponse,
+    CateResponse,
+    HealthResponse,
+    SessionResponse,
+    UploadResponse,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)-24s | %(levelname)-6s | %(message)s",
+)
+logger = logging.getLogger("causal_effect.api")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting Causal Effect API")
+    yield
+    if os.path.exists(UPLOAD_DIR):
+        shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+    logger.info("Cleanup complete")
+
 
 app = FastAPI(
-    title="CausalInsight API",
+    title="Causal Effect API",
     version="2.0.0",
-    description="Interactive Enterprise Causal Inference Platform",
+    description="Causal inference analysis platform — DoWhy + EconML",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -28,7 +59,16 @@ UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 SAMPLE_DATA = os.path.join(os.path.dirname(__file__), "sample_causal_data.csv")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-sessions = {}
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+sessions: dict[str, dict] = {}
+
+
+def _get_session(session_id: str) -> dict:
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found or expired. Re-upload the CSV.")
+    return session
 
 
 def _parse_csv_metadata(filepath: str, filename: str):
@@ -67,39 +107,46 @@ def _parse_csv_metadata(filepath: str, filename: str):
 
 
 async def _handle_upload(file: UploadFile):
-    if not file.filename.lower().endswith(".csv"):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(400, "Only CSV files accepted")
+
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB")
 
     session_id = str(uuid.uuid4())[:8]
     filepath = os.path.join(UPLOAD_DIR, f"{session_id}.csv")
 
-    content = await file.read()
-    with open(filepath, "wb") as f:
-        f.write(content)
+    try:
+        with open(filepath, "wb") as f:
+            f.write(content)
+    except OSError as e:
+        logger.error(f"Failed to write upload: {e}")
+        raise HTTPException(500, "Failed to save uploaded file")
 
     try:
         df, metadata = _parse_csv_metadata(filepath, file.filename)
     except Exception as e:
         os.remove(filepath)
+        logger.warning(f"CSV parse failed: {e}")
         raise HTTPException(400, f"Failed to parse CSV: {str(e)}")
 
     sessions[session_id] = {"filepath": filepath, "df": df, "columns": metadata["all_columns"]}
+    logger.info(f"Session {session_id}: {metadata['rows']} rows, {metadata['columns']} cols")
 
     return JSONResponse({"session_id": session_id, **metadata})
 
 
 def _run_analysis(session_id: str, treatment: str, outcome: str, confounders: str):
-    if session_id not in sessions:
-        raise HTTPException(400, "Session expired or invalid. Re-upload the CSV.")
-
+    session = _get_session(session_id)
     confounders_list = [c.strip() for c in confounders.split(",") if c.strip()]
-    session = sessions[session_id]
     df = session["df"]
 
     for col in [treatment, outcome] + confounders_list:
         if col not in df.columns:
             raise HTTPException(400, f"Column '{col}' not found in dataset")
 
+    logger.info(f"Analysis start: treatment={treatment}, outcome={outcome}, confounders={confounders_list}")
     try:
         engine = CausalInsightEngine(df)
         results = engine.full_analysis(treatment, outcome, confounders_list)
@@ -108,32 +155,55 @@ def _run_analysis(session_id: str, treatment: str, outcome: str, confounders: st
             "outcome": outcome,
             "confounders": confounders_list,
         }
+        logger.info(f"Analysis complete for session {session_id}")
         return JSONResponse({"status": "success", "results": results})
+    except ValueError as e:
+        logger.error(f"Analysis validation error: {e}")
+        raise HTTPException(422, str(e))
     except Exception as e:
+        logger.exception(f"Analysis failed for session {session_id}")
         raise HTTPException(500, f"Analysis failed: {str(e)}")
 
 
-@app.get("/")
+# === Auth middleware (Tip 23) ===
+API_TOKEN = os.environ.get("CAUSAL_EFFECT_API_TOKEN")
+
+
+async def verify_token(authorization: str = None):
+    if API_TOKEN is None:
+        return True
+    if not authorization:
+        raise HTTPException(401, "Missing Authorization header")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token != API_TOKEN:
+        raise HTTPException(403, "Invalid API token")
+    return True
+
+
+# === Endpoints ===
+
+@app.get("/", tags=["Meta"])
 def root():
     return {
-        "service": "CausalInsight API",
+        "service": "Causal Effect API",
         "status": "ready",
         "version": "2.0.0",
         "endpoints": {
-            "upload": ["/upload-csv", "/upload-metadata"],
-            "analyze": ["/analyze", "/compute-causal-impact"],
+            "upload": "/upload-csv",
+            "analyze": "/analyze",
             "cate": "/cate",
             "health": "/health",
+            "docs": "/docs",
         },
     }
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse, tags=["Meta"])
 def health():
-    return {"status": "healthy", "active_sessions": len(sessions)}
+    return HealthResponse(status="healthy", active_sessions=len(sessions))
 
 
-@app.get("/sample-data")
+@app.get("/sample-data", tags=["Data"])
 def download_sample():
     if not os.path.exists(SAMPLE_DATA):
         raise HTTPException(404, "Sample dataset not found")
@@ -144,17 +214,17 @@ def download_sample():
     )
 
 
-@app.post("/upload-csv")
+@app.post("/upload-csv", tags=["Data"])
 async def upload_csv(file: UploadFile = File(...)):
     return await _handle_upload(file)
 
 
-@app.post("/upload-metadata")
+@app.post("/upload-metadata", tags=["Data"])
 async def upload_metadata(file: UploadFile = File(...)):
     return await _handle_upload(file)
 
 
-@app.post("/analyze")
+@app.post("/analyze", tags=["Analysis"])
 async def analyze(
     session_id: str = Form(...),
     treatment: str = Form(...),
@@ -164,7 +234,7 @@ async def analyze(
     return _run_analysis(session_id, treatment, outcome, confounders)
 
 
-@app.post("/compute-causal-impact")
+@app.post("/compute-causal-impact", tags=["Analysis"])
 async def compute_causal_impact(
     session_id: str = Form(...),
     treatment: str = Form(...),
@@ -174,7 +244,7 @@ async def compute_causal_impact(
     return _run_analysis(session_id, treatment, outcome, confounders)
 
 
-@app.post("/cate")
+@app.post("/cate", tags=["Analysis"])
 async def cate_analysis(
     session_id: str = Form(...),
     treatment: str = Form(...),
@@ -182,11 +252,8 @@ async def cate_analysis(
     confounders: str = Form(...),
     feature: str = Form(...),
 ):
-    if session_id not in sessions:
-        raise HTTPException(400, "Session expired or invalid.")
-
+    session = _get_session(session_id)
     confounders_list = [c.strip() for c in confounders.split(",") if c.strip()]
-    session = sessions[session_id]
     df = session["df"]
 
     for col in [treatment, outcome, feature] + confounders_list:
@@ -204,15 +271,13 @@ async def cate_analysis(
             "cate": cate_result,
         })
     except Exception as e:
+        logger.exception("CATE analysis failed")
         raise HTTPException(500, f"CATE analysis failed: {str(e)}")
 
 
-@app.get("/sessions/{session_id}")
+@app.get("/sessions/{session_id}", tags=["Session"])
 def get_session(session_id: str):
-    if session_id not in sessions:
-        raise HTTPException(404, "Session not found")
-
-    session = sessions[session_id]
+    session = _get_session(session_id)
     df = session["df"]
     return {
         "session_id": session_id,
@@ -223,12 +288,7 @@ def get_session(session_id: str):
     }
 
 
-@app.on_event("shutdown")
-def cleanup():
-    import shutil
-    if os.path.exists(UPLOAD_DIR):
-        shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Cleanup handled via lifespan context manager
 
 
 if __name__ == "__main__":

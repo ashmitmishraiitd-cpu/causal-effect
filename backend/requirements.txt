@@ -3,6 +3,10 @@ uvicorn[standard]==0.34.0
 pandas==2.2.3
 numpy==2.2.1
 scikit-learn==1.6.1
+scipy==1.15.0
 dowhy==0.14
 econml==0.16.0
 python-multipart==0.0.18
+pydantic==2.10.4
+networkx==3.4.2
+structlog==25.1.0
